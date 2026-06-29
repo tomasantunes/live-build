@@ -59,6 +59,13 @@
       border: 1px solid #e1e7ef;
     }
 
+    .message.loading {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      color: #526071;
+    }
+
     .project-list {
       font-size: 0.92rem;
       color: #cbd5e1;
@@ -68,6 +75,26 @@
       color: #f8fafc;
       text-align: left;
       text-decoration: none;
+    }
+
+    .project-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .delete-project {
+      color: #fecaca;
+      border-color: rgba(254, 202, 202, 0.45);
+      padding: 2px 8px;
+      font-size: 0.78rem;
+    }
+
+    .delete-project:hover {
+      color: #ffffff;
+      background: #dc3545;
+      border-color: #dc3545;
     }
 
     @media (max-width: 860px) {
@@ -88,9 +115,12 @@
       <div class="small text-uppercase text-secondary fw-bold mb-2">Projects</div>
       <div class="project-list d-grid gap-1">
         {% for project in projects %}
-          <button class="btn btn-link p-0 project-link" type="button" data-project="{{ project }}">{{ project }}</button>
+          <div class="project-row" data-project-row="{{ project }}">
+            <button class="btn btn-link p-0 project-link" type="button" data-project="{{ project }}">{{ project }}</button>
+            <button class="btn btn-sm btn-outline-danger delete-project" type="button" data-project="{{ project }}">Delete</button>
+          </div>
         {% else %}
-          <span>No projects yet.</span>
+          <span id="emptyProjects">No projects yet.</span>
         {% endfor %}
       </div>
     </aside>
@@ -98,10 +128,13 @@
     <main class="main-pane">
       <div class="d-flex flex-wrap gap-2 align-items-center justify-content-between">
         <div>
-          <h2 class="h4 mb-1">Build and edit a whole app folder</h2>
-          <p class="text-secondary mb-0">Chat with the agent, then publish to serve it from <code>/apps/[project_name]</code>.</p>
+          <h2 class="h4 mb-1">Build and edit a full app folder</h2>
+          <p class="text-secondary mb-0">Publish frontends at <code>/apps/[project_name]</code> and optional backends at <code>/api/apps/[project_name]</code>.</p>
         </div>
-        <a id="publishedLink" class="btn btn-outline-dark disabled" href="#" target="_blank" rel="noreferrer">Open published app</a>
+        <div class="d-flex flex-wrap gap-2">
+          <a id="downloadLink" class="btn btn-outline-primary disabled" href="#" download>Download ZIP</a>
+          <a id="publishedLink" class="btn btn-outline-dark disabled" href="#" target="_blank" rel="noreferrer">Open published app</a>
+        </div>
       </div>
 
       <section id="chatLog" class="chat-log" aria-live="polite">
@@ -122,17 +155,46 @@
       $("#chatLog").append(message).scrollTop($("#chatLog")[0].scrollHeight);
     }
 
+    function showLoadingMessage() {
+      removeLoadingMessage();
+      const message = $("<div>")
+        .attr("id", "loadingMessage")
+        .addClass("message agent loading")
+        .append(
+          $("<span>").addClass("spinner-border spinner-border-sm").attr({
+            role: "status",
+            "aria-hidden": "true"
+          }),
+          $("<span>").text("Waiting for the agent...")
+        );
+      $("#chatLog").append(message).scrollTop($("#chatLog")[0].scrollHeight);
+    }
+
+    function removeLoadingMessage() {
+      $("#loadingMessage").remove();
+    }
+
     function projectName() {
       return $("#projectName").val().trim();
     }
 
     function setBusy(isBusy) {
-      $("#sendButton, #publishButton").prop("disabled", isBusy);
+      $("#sendButton, #publishButton, .delete-project").prop("disabled", isBusy);
     }
 
     function setPublishedLink(name) {
       const url = "/apps/" + encodeURIComponent(name) + "/";
       $("#publishedLink").removeClass("disabled").attr("href", url).text("Open " + url);
+    }
+
+    function setDownloadLink(name) {
+      const url = "/api/download/" + encodeURIComponent(name);
+      $("#downloadLink").removeClass("disabled").attr("href", url).attr("download", name + ".zip");
+    }
+
+    function resetProjectActions() {
+      $("#publishedLink").addClass("disabled").attr("href", "#").text("Open published app");
+      $("#downloadLink").addClass("disabled").attr("href", "#").attr("download", "");
     }
 
     function errorText(xhr, fallback) {
@@ -149,6 +211,40 @@
       const name = $(this).data("project");
       $("#projectName").val(name);
       setPublishedLink(name);
+      setDownloadLink(name);
+    });
+
+    $(".delete-project").on("click", function () {
+      const button = $(this);
+      const name = button.data("project");
+      const confirmed = window.confirm("Delete " + name + "? This removes the generated and published app files.");
+      if (!confirmed) {
+        return;
+      }
+
+      setBusy(true);
+      button.prop("disabled", true);
+      $.ajax({
+        url: "/api/delete",
+        method: "POST",
+        contentType: "application/json",
+        data: JSON.stringify({ project_name: name }),
+      }).done(function (response) {
+        $("[data-project-row='" + response.project_name + "']").remove();
+        if (projectName() === response.project_name) {
+          $("#projectName").val("");
+          resetProjectActions();
+        }
+        if (!$(".project-row").length) {
+          $(".project-list").append($("<span>").attr("id", "emptyProjects").text("No projects yet."));
+        }
+        appendMessage("agent", response.reply);
+      }).fail(function (xhr) {
+        button.prop("disabled", false);
+        appendMessage("agent", errorText(xhr, "The project could not be deleted."));
+      }).always(function () {
+        setBusy(false);
+      });
     });
 
     $("#chatForm").on("submit", function (event) {
@@ -164,6 +260,7 @@
       appendMessage("user", message);
       $("#messageInput").val("");
       setBusy(true);
+      showLoadingMessage();
 
       $.ajax({
         url: "/api/chat",
@@ -174,10 +271,12 @@
         const changed = response.changed_files && response.changed_files.length
           ? "\nChanged files: " + response.changed_files.join(", ")
           : "";
+        setDownloadLink(response.project_name);
         appendMessage("agent", response.reply + changed);
       }).fail(function (xhr) {
         appendMessage("agent", errorText(xhr, "The agent could not update the project."));
       }).always(function () {
+        removeLoadingMessage();
         setBusy(false);
       });
     });
@@ -198,6 +297,7 @@
       }).done(function (response) {
         appendMessage("agent", response.reply);
         setPublishedLink(response.project_name);
+        setDownloadLink(response.project_name);
       }).fail(function (xhr) {
         appendMessage("agent", errorText(xhr, "The project could not be published."));
       }).always(function () {

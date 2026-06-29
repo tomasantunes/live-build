@@ -98,6 +98,28 @@ def publish_project(project_name):
     }
 
 
+def delete_project(project_name):
+    name = sanitize_project_name(project_name)
+    if not name:
+        raise AgentBuildError("Write an app name first.")
+
+    removed = []
+    for base_dir in (PROJECTS_DIR, PUBLISHED_DIR):
+        target = (base_dir / name).resolve()
+        base = base_dir.resolve()
+        if target != base and base in target.parents and target.exists():
+            shutil.rmtree(target)
+            removed.append(target.name)
+
+    if not removed:
+        raise AgentBuildError("This project does not exist.")
+
+    return {
+        "project_name": name,
+        "reply": f"Deleted {name}.",
+    }
+
+
 def _generate_files(project_name, message, target):
     generated = _generate_with_openai(project_name, message, target)
     files = generated.get("files", [])
@@ -114,8 +136,9 @@ def _generate_with_openai(project_name, message, target):
     model = os.getenv("OPENAI_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
     context = _project_context(target)
     prompt = f"""
-You are editing a complete static web app folder named "{project_name}".
+You are editing a complete web app folder named "{project_name}".
 The app will be served by Flask at /apps/{project_name}/.
+Optional app backends are served by Flask at /api/apps/{project_name}/.
 
 Rules:
 - Return JSON only.
@@ -128,6 +151,17 @@ Rules:
 - If the user asks for a game, implement the actual playable game.
 - If the user asks for canvas, include a working canvas implementation.
 - Include all JavaScript needed for interactivity.
+- When server-side persistence, shared data, accounts, dashboards, CRUD APIs, or database-backed features are useful, also create backend.py.
+- Frontend code must call the app backend with relative URLs under /api/apps/{project_name}/, for example fetch("/api/apps/{project_name}/items").
+- backend.py must not start a Flask server and must not create its own MongoClient.
+- backend.py must define exactly this callable:
+  def handle_request(path, method, data, query, db, headers):
+      ...
+- The provided db argument is a pymongo MongoDB database connected to MongoDB at port 27017.
+- Use pymongo collections from db, validate methods and paths, and return JSON-safe data.
+- Convert Mongo ObjectId values to strings before returning documents.
+- handle_request may return a dict/list body, (body, status), or (body, status, headers).
+- For unsupported backend routes return {{"ok": False, "error": "Not found"}}, 404.
 
 Current files:
 {context}
