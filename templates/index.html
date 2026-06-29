@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Project Agent Builder</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body {
+      min-height: 100vh;
+      background: #eef1f5;
+      color: #202833;
+    }
+
+    .builder-layout {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: 360px minmax(0, 1fr);
+    }
+
+    .sidebar {
+      background: #17202a;
+      color: #f8fafc;
+      padding: 28px;
+    }
+
+    .main-pane {
+      padding: 28px;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      gap: 18px;
+    }
+
+    .chat-log {
+      overflow: auto;
+      background: #ffffff;
+      border: 1px solid #d9e0ea;
+      border-radius: 8px;
+      padding: 18px;
+      min-height: 420px;
+    }
+
+    .message {
+      max-width: 760px;
+      margin-bottom: 12px;
+      padding: 12px 14px;
+      border-radius: 8px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+    }
+
+    .message.user {
+      margin-left: auto;
+      background: #d9ecff;
+    }
+
+    .message.agent {
+      background: #f3f5f8;
+      border: 1px solid #e1e7ef;
+    }
+
+    .project-list {
+      font-size: 0.92rem;
+      color: #cbd5e1;
+    }
+
+    .project-list button {
+      color: #f8fafc;
+      text-align: left;
+      text-decoration: none;
+    }
+
+    @media (max-width: 860px) {
+      .builder-layout {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="builder-layout">
+    <aside class="sidebar">
+      <h1 class="h3 mb-4">Project Agent</h1>
+      <label for="projectName" class="form-label">App name</label>
+      <input id="projectName" class="form-control mb-3" type="text" placeholder="my-new-app" autocomplete="off">
+      <button id="publishButton" class="btn btn-success w-100 mb-4" type="button">Publish</button>
+
+      <div class="small text-uppercase text-secondary fw-bold mb-2">Projects</div>
+      <div class="project-list d-grid gap-1">
+        {% for project in projects %}
+          <button class="btn btn-link p-0 project-link" type="button" data-project="{{ project }}">{{ project }}</button>
+        {% else %}
+          <span>No projects yet.</span>
+        {% endfor %}
+      </div>
+    </aside>
+
+    <main class="main-pane">
+      <div class="d-flex flex-wrap gap-2 align-items-center justify-content-between">
+        <div>
+          <h2 class="h4 mb-1">Build and edit a whole app folder</h2>
+          <p class="text-secondary mb-0">Chat with the agent, then publish to serve it from <code>/apps/[project_name]</code>.</p>
+        </div>
+        <a id="publishedLink" class="btn btn-outline-dark disabled" href="#" target="_blank" rel="noreferrer">Open published app</a>
+      </div>
+
+      <section id="chatLog" class="chat-log" aria-live="polite">
+        <div class="message agent">Write an app name, describe what to build, and send the first message.</div>
+      </section>
+
+      <form id="chatForm" class="input-group">
+        <textarea id="messageInput" class="form-control" rows="2" placeholder="Build a dashboard for tracking freelance invoices..."></textarea>
+        <button id="sendButton" class="btn btn-primary px-4" type="submit">Send</button>
+      </form>
+    </main>
+  </div>
+
+  <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+  <script>
+    function appendMessage(role, text) {
+      const message = $("<div>").addClass("message").addClass(role).text(text);
+      $("#chatLog").append(message).scrollTop($("#chatLog")[0].scrollHeight);
+    }
+
+    function projectName() {
+      return $("#projectName").val().trim();
+    }
+
+    function setBusy(isBusy) {
+      $("#sendButton, #publishButton").prop("disabled", isBusy);
+    }
+
+    function setPublishedLink(name) {
+      const url = "/apps/" + encodeURIComponent(name) + "/";
+      $("#publishedLink").removeClass("disabled").attr("href", url).text("Open " + url);
+    }
+
+    function errorText(xhr, fallback) {
+      if (xhr.responseJSON && xhr.responseJSON.error) {
+        return xhr.responseJSON.error;
+      }
+      if (xhr.responseText) {
+        return xhr.responseText;
+      }
+      return fallback;
+    }
+
+    $(".project-link").on("click", function () {
+      const name = $(this).data("project");
+      $("#projectName").val(name);
+      setPublishedLink(name);
+    });
+
+    $("#chatForm").on("submit", function (event) {
+      event.preventDefault();
+
+      const name = projectName();
+      const message = $("#messageInput").val().trim();
+      if (!name || !message) {
+        appendMessage("agent", "Write an app name and a message first.");
+        return;
+      }
+
+      appendMessage("user", message);
+      $("#messageInput").val("");
+      setBusy(true);
+
+      $.ajax({
+        url: "/api/chat",
+        method: "POST",
+        contentType: "application/json",
+        data: JSON.stringify({ project_name: name, message }),
+      }).done(function (response) {
+        const changed = response.changed_files && response.changed_files.length
+          ? "\nChanged files: " + response.changed_files.join(", ")
+          : "";
+        appendMessage("agent", response.reply + changed);
+      }).fail(function (xhr) {
+        appendMessage("agent", errorText(xhr, "The agent could not update the project."));
+      }).always(function () {
+        setBusy(false);
+      });
+    });
+
+    $("#publishButton").on("click", function () {
+      const name = projectName();
+      if (!name) {
+        appendMessage("agent", "Write an app name first.");
+        return;
+      }
+
+      setBusy(true);
+      $.ajax({
+        url: "/api/publish",
+        method: "POST",
+        contentType: "application/json",
+        data: JSON.stringify({ project_name: name }),
+      }).done(function (response) {
+        appendMessage("agent", response.reply);
+        setPublishedLink(response.project_name);
+      }).fail(function (xhr) {
+        appendMessage("agent", errorText(xhr, "The project could not be published."));
+      }).always(function () {
+        setBusy(false);
+      });
+    });
+  </script>
+</body>
+</html>
