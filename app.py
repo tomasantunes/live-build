@@ -125,6 +125,16 @@ def index():
     return render_template("index.html", projects=list_projects(), auth_user=session.get("auth_user"))
 
 
+@app.get("/analytics")
+def analytics():
+    return render_template(
+        "analytics.html",
+        projects=list_projects(),
+        auth_user=session.get("auth_user"),
+        analytics=_analytics_snapshot(),
+    )
+
+
 def _auth_credentials():
     username = os.getenv("AUTH_USER", os.getenv("AUTH_USERNAME", "")).strip()
     password = os.getenv("AUTH_PASSWORD", "")
@@ -425,6 +435,82 @@ def _mongo_database(project_name):
 
     db_name = "live_build_" + project_name.replace("-", "_")
     return _mongo_client[db_name]
+
+
+def _analytics_snapshot():
+    projects = set(list_projects())
+    if PUBLISHED_DIR.exists():
+        projects.update(path.name for path in PUBLISHED_DIR.iterdir() if path.is_dir())
+
+    mongo = {
+        "database_count": 0,
+        "total_records": 0,
+        "databases": [],
+        "error": None,
+    }
+
+    if MongoClient is None:
+        mongo["error"] = "pymongo is not installed in this Python environment."
+        return {"app_count": len(projects), "mongo": mongo}
+
+    try:
+        uri = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
+        client = MongoClient(uri, serverSelectionTimeoutMS=2000)
+        client.admin.command("ping")
+        database_names = sorted(client.list_database_names())
+    except Exception as exc:
+        mongo["error"] = f"MongoDB is not reachable: {exc}"
+        return {"app_count": len(projects), "mongo": mongo}
+
+    try:
+        for database_name in database_names:
+            database = client[database_name]
+            database_total = 0
+            collections = []
+            try:
+                collection_names = sorted(database.list_collection_names())
+            except Exception as exc:
+                collections.append(
+                    {
+                        "name": "Collections unavailable",
+                        "record_count": None,
+                        "error": str(exc),
+                    }
+                )
+                collection_names = []
+
+            for collection_name in collection_names:
+                collection = database[collection_name]
+                collection_record_count = None
+                collection_error = None
+                try:
+                    collection_record_count = collection.count_documents({})
+                    database_total += collection_record_count
+                except Exception as exc:
+                    collection_error = str(exc)
+
+                collections.append(
+                    {
+                        "name": collection_name,
+                        "record_count": collection_record_count,
+                        "error": collection_error,
+                    }
+                )
+
+            mongo["databases"].append(
+                {
+                    "name": database_name,
+                    "collection_count": len(collection_names),
+                    "record_count": database_total,
+                    "collections": collections,
+                }
+            )
+            mongo["total_records"] += database_total
+    finally:
+        client.close()
+
+    mongo["database_count"] = len(mongo["databases"])
+    return {"app_count": len(projects), "mongo": mongo}
 
 
 def _run_chat_job(job_id, project_name, message):
