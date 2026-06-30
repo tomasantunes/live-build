@@ -2,7 +2,12 @@ import json
 import os
 import re
 import shutil
+import socket
+import subprocess
+import sys
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from html import escape
@@ -22,6 +27,11 @@ MAX_CONTEXT_CHARS = 24000
 SAFE_FILE_PATTERN = re.compile(r"^[a-zA-Z0-9._\-/]+$")
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 DEFAULT_MODEL = "gpt-4.1-mini"
+DEFAULT_OPENAI_REQUEST_TIMEOUT_SECONDS = 45
+DEFAULT_OPENAI_POLL_INTERVAL_SECONDS = 2
+DEFAULT_OPENAI_BACKGROUND_TIMEOUT_SECONDS = 600
+_APP_PROCESSES = {}
+_ACTIVE_APP_NAME = None
 
 
 class AgentBuildError(Exception):
@@ -75,6 +85,7 @@ def apply_agent_message(project_name, message):
 
 
 def publish_project(project_name):
+    global _ACTIVE_APP_NAME
     name = sanitize_project_name(project_name)
     source = project_dir(name)
     destination = PUBLISHED_DIR / name
@@ -85,23 +96,37 @@ def publish_project(project_name):
     if not (source / "index.html").exists():
         raise AgentBuildError("This project has no index.html. Build it again before publishing.")
 
+    _stop_project_process(name)
+
     if destination.exists():
         shutil.rmtree(destination)
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(source, destination)
 
+    process_info = _start_project_app_process(name, destination)
+    _ACTIVE_APP_NAME = name
+
+    details = ""
+    if process_info:
+        details = f" Python backend running on port {process_info['port']}."
+
     return {
         "project_name": name,
         "url": f"/apps/{name}/",
-        "reply": f"Published {name} at /apps/{name}/.",
+        "reply": f"Published {name} at /apps/{name}/.{details}",
     }
 
 
 def delete_project(project_name):
+    global _ACTIVE_APP_NAME
     name = sanitize_project_name(project_name)
     if not name:
         raise AgentBuildError("Write an app name first.")
+
+    _stop_project_process(name)
+    if _ACTIVE_APP_NAME == name:
+        _ACTIVE_APP_NAME = None
 
     removed = []
     for base_dir in (PROJECTS_DIR, PUBLISHED_DIR):
@@ -118,6 +143,120 @@ def delete_project(project_name):
         "project_name": name,
         "reply": f"Deleted {name}.",
     }
+
+
+def active_project_app_backend():
+    if not _ACTIVE_APP_NAME:
+        return None
+    return project_app_backend(_ACTIVE_APP_NAME)
+
+
+def project_app_backend(project_name):
+    name = sanitize_project_name(project_name)
+    info = _APP_PROCESSES.get(name)
+    if not info:
+        return None
+
+    process = info["process"]
+    if process.poll() is not None:
+        _APP_PROCESSES.pop(name, None)
+        return None
+
+    return {
+        "project_name": name,
+        "port": info["port"],
+        "base_url": f"http://127.0.0.1:{info['port']}",
+    }
+
+
+def _start_project_app_process(project_name, destination):
+    app_file = destination / "app.py"
+    if not app_file.exists():
+        return None
+
+    port = _find_free_local_port()
+    stdout_log = LOG_DIR / f"{project_name}_app_stdout.log"
+    stderr_log = LOG_DIR / f"{project_name}_app_stderr.log"
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    env = os.environ.copy()
+    python_path_parts = [str(ROOT)]
+    if env.get("PYTHONPATH"):
+        python_path_parts.append(env["PYTHONPATH"])
+    env.update(
+        {
+            "PORT": str(port),
+            "FLASK_RUN_PORT": str(port),
+            "FLASK_RUN_HOST": "127.0.0.1",
+            "PYTHONUNBUFFERED": "1",
+            "PYTHONPATH": os.pathsep.join(python_path_parts),
+        }
+    )
+
+    command = [
+        sys.executable,
+        "-m",
+        "autocoder_framework.generated_app_runner",
+        str(app_file),
+        str(port),
+    ]
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    stdout_handle = stdout_log.open("a", encoding="utf-8")
+    stderr_handle = stderr_log.open("a", encoding="utf-8")
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=str(destination),
+            env=env,
+            stdout=stdout_handle,
+            stderr=stderr_handle,
+            creationflags=creationflags,
+        )
+    except Exception:
+        stdout_handle.close()
+        stderr_handle.close()
+        raise
+
+    _APP_PROCESSES[project_name] = {
+        "process": process,
+        "port": port,
+        "stdout": stdout_handle,
+        "stderr": stderr_handle,
+    }
+    time.sleep(0.5)
+    if process.poll() is not None:
+        _stop_project_process(project_name)
+        raise AgentBuildError(
+            f"Published {project_name}, but its app.py backend exited immediately. "
+            f"Check {stderr_log.relative_to(ROOT).as_posix()} for details."
+        )
+    return _APP_PROCESSES[project_name]
+
+
+def _stop_project_process(project_name):
+    info = _APP_PROCESSES.pop(project_name, None)
+    if not info:
+        return
+
+    process = info["process"]
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+    for key in ("stdout", "stderr"):
+        handle = info.get(key)
+        if handle:
+            handle.close()
+
+
+def _find_free_local_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
 
 
 def _generate_files(project_name, message, target):
@@ -151,8 +290,10 @@ Rules:
 - If the user asks for a game, implement the actual playable game.
 - If the user asks for canvas, include a working canvas implementation.
 - Include all JavaScript needed for interactivity.
-- When server-side persistence, shared data, accounts, dashboards, CRUD APIs, or database-backed features are useful, also create backend.py.
-- Frontend code must call the app backend with relative URLs under /api/apps/{project_name}/, for example fetch("/api/apps/{project_name}/items").
+- When server-side persistence, shared data, accounts, dashboards, CRUD APIs, or database-backed features are useful, create backend.py or app.py.
+- If creating app.py, expose a Flask instance named app, define routes under /api/..., and do not hardcode a port.
+- If app.py has a main block, run with port=int(os.environ.get("PORT", "5000")), debug=False, and use_reloader=False.
+- Frontend code should call app.py routes with relative URLs such as /api/posts, or backend.py routes under /api/apps/{project_name}/.
 - backend.py must not start a Flask server and must not create its own MongoClient.
 - backend.py must define exactly this callable:
   def handle_request(path, method, data, query, db, headers):
@@ -178,7 +319,10 @@ JSON shape:
 }}
 """
 
-    request_payload = {"model": model, "input": prompt}
+    request_payload = {"model": model, "input": prompt, "background": True}
+    max_output_tokens = _env_int("OPENAI_MAX_OUTPUT_TOKENS", None)
+    if max_output_tokens:
+        request_payload["max_output_tokens"] = max_output_tokens
     _log_openai_exchange(
         "request",
         {
@@ -188,60 +332,8 @@ JSON shape:
         },
     )
 
-    payload = json.dumps(request_payload).encode("utf-8")
-    request = urllib.request.Request(
-        OPENAI_RESPONSES_URL,
-        data=payload,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(request, timeout=90) as response:
-            raw_response = response.read().decode("utf-8", errors="replace")
-            _log_openai_exchange(
-                "response",
-                {
-                    "project_name": project_name,
-                    "status": response.status,
-                    "body": raw_response,
-                },
-            )
-            response_data = json.loads(raw_response)
-    except urllib.error.HTTPError as exc:
-        details = exc.read().decode("utf-8", errors="replace")
-        _log_openai_exchange(
-            "response_error",
-            {
-                "project_name": project_name,
-                "status": exc.code,
-                "body": details,
-            },
-        )
-        raise AgentBuildError(f"OpenAI API error {exc.code}:\n{details}") from exc
-    except urllib.error.URLError as exc:
-        _log_openai_exchange(
-            "transport_error",
-            {
-                "project_name": project_name,
-                "error": str(exc.reason),
-            },
-        )
-        raise AgentBuildError(f"Could not reach the OpenAI API: {exc.reason}") from exc
-    except TimeoutError as exc:
-        _log_openai_exchange(
-            "transport_error",
-            {
-                "project_name": project_name,
-                "error": "request timed out",
-            },
-        )
-        raise AgentBuildError("The OpenAI API request timed out. Try again.") from exc
-    except json.JSONDecodeError as exc:
-        raise AgentBuildError(f"OpenAI returned non-JSON response:\n{raw_response}") from exc
+    response_data = _create_openai_background_response(project_name, api_key, request_payload)
+    response_data = _wait_for_openai_response(project_name, api_key, response_data)
 
     output_text = _extract_response_text(response_data)
     if not output_text:
@@ -261,6 +353,139 @@ JSON shape:
         "reply": data.get("reply", ""),
         "model": response_data.get("model", model),
     }
+
+
+def _create_openai_background_response(project_name, api_key, request_payload):
+    raw_response = _openai_json_request(
+        project_name=project_name,
+        api_key=api_key,
+        url=OPENAI_RESPONSES_URL,
+        method="POST",
+        payload=request_payload,
+        event_name="response_created",
+    )
+    return raw_response
+
+
+def _wait_for_openai_response(project_name, api_key, response_data):
+    response_id = response_data.get("id")
+    if not response_id:
+        return response_data
+
+    status = response_data.get("status")
+    deadline = time.monotonic() + _env_int(
+        "OPENAI_BACKGROUND_TIMEOUT_SECONDS",
+        DEFAULT_OPENAI_BACKGROUND_TIMEOUT_SECONDS,
+    )
+    while status in {"queued", "in_progress"}:
+        if time.monotonic() >= deadline:
+            raise AgentBuildError(
+                "OpenAI is still building this app in the background. "
+                f"Response id: {response_id}. Try again or increase OPENAI_BACKGROUND_TIMEOUT_SECONDS."
+            )
+
+        time.sleep(_env_float("OPENAI_POLL_INTERVAL_SECONDS", DEFAULT_OPENAI_POLL_INTERVAL_SECONDS))
+        response_data = _retrieve_openai_response(project_name, api_key, response_id)
+        status = response_data.get("status")
+
+    if status in {"completed", None}:
+        return response_data
+
+    error = response_data.get("error") or response_data.get("incomplete_details") or response_data
+    raise AgentBuildError(f"OpenAI response did not complete. Status: {status}. Details:\n{json.dumps(error, indent=2)}")
+
+
+def _retrieve_openai_response(project_name, api_key, response_id):
+    safe_id = urllib.parse.quote(str(response_id), safe="")
+    return _openai_json_request(
+        project_name=project_name,
+        api_key=api_key,
+        url=f"{OPENAI_RESPONSES_URL}/{safe_id}",
+        method="GET",
+        payload=None,
+        event_name="response_poll",
+    )
+
+
+def _openai_json_request(project_name, api_key, url, method, payload=None, event_name="response"):
+    request_body = None
+    headers = {"Authorization": f"Bearer {api_key}"}
+    if payload is not None:
+        request_body = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    request = urllib.request.Request(url, data=request_body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=_env_int("OPENAI_REQUEST_TIMEOUT_SECONDS", DEFAULT_OPENAI_REQUEST_TIMEOUT_SECONDS),
+        ) as response:
+            raw_response = response.read().decode("utf-8", errors="replace")
+            _log_openai_exchange(
+                event_name,
+                {
+                    "project_name": project_name,
+                    "status": response.status,
+                    "body": raw_response,
+                },
+            )
+            return json.loads(raw_response)
+    except urllib.error.HTTPError as exc:
+        details = exc.read().decode("utf-8", errors="replace")
+        _log_openai_exchange(
+            "response_error",
+            {
+                "project_name": project_name,
+                "status": exc.code,
+                "body": details,
+            },
+        )
+        raise AgentBuildError(f"OpenAI API error {exc.code}:\n{_extract_api_error(details)}") from exc
+    except urllib.error.URLError as exc:
+        reason = exc.reason
+        _log_openai_exchange(
+            "transport_error",
+            {
+                "project_name": project_name,
+                "error": str(reason),
+            },
+        )
+        if isinstance(reason, TimeoutError) or isinstance(reason, socket.timeout):
+            raise AgentBuildError(
+                "The connection to OpenAI timed out before the request could be completed. Try again."
+            ) from exc
+        raise AgentBuildError(f"Could not reach the OpenAI API: {reason}") from exc
+    except (TimeoutError, socket.timeout) as exc:
+        _log_openai_exchange(
+            "transport_error",
+            {
+                "project_name": project_name,
+                "error": "request timed out",
+            },
+        )
+        raise AgentBuildError("The connection to OpenAI timed out before the request could be completed. Try again.") from exc
+    except json.JSONDecodeError as exc:
+        raise AgentBuildError(f"OpenAI returned non-JSON response:\n{raw_response}") from exc
+
+
+def _env_int(name, default):
+    value = os.getenv(name, "").strip()
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _env_float(name, default):
+    value = os.getenv(name, "").strip()
+    if not value:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
 
 
 def _extract_response_text(response_data):

@@ -27,7 +27,7 @@
     .main-pane {
       padding: 28px;
       display: grid;
-      grid-template-rows: auto 1fr auto;
+      grid-template-rows: auto auto 1fr auto;
       gap: 18px;
     }
 
@@ -126,6 +126,15 @@
     </aside>
 
     <main class="main-pane">
+      <div class="d-flex justify-content-end align-items-center gap-3">
+        {% if auth_user %}
+          <span class="small text-secondary">Signed in as {{ auth_user }}</span>
+        {% endif %}
+        <form method="post" action="{{ url_for('logout') }}" class="m-0">
+          <button class="btn btn-sm btn-outline-secondary" type="submit">Sign out</button>
+        </form>
+      </div>
+
       <div class="d-flex flex-wrap gap-2 align-items-center justify-content-between">
         <div>
           <h2 class="h4 mb-1">Build and edit a full app folder</h2>
@@ -195,6 +204,43 @@
     function resetProjectActions() {
       $("#publishedLink").addClass("disabled").attr("href", "#").text("Open published app");
       $("#downloadLink").addClass("disabled").attr("href", "#").attr("download", "");
+    }
+
+    function finishChatRequest() {
+      removeLoadingMessage();
+      setBusy(false);
+    }
+
+    function handleChatResult(response) {
+      const changed = response.changed_files && response.changed_files.length
+        ? "\nChanged files: " + response.changed_files.join(", ")
+        : "";
+      setDownloadLink(response.project_name);
+      appendMessage("agent", response.reply + changed);
+      finishChatRequest();
+    }
+
+    function pollChatJob(jobId) {
+      $.ajax({
+        url: "/api/chat/" + encodeURIComponent(jobId),
+        method: "GET",
+      }).done(function (job) {
+        if (job.status === "completed") {
+          handleChatResult(job.result);
+          return;
+        }
+        if (job.status === "failed") {
+          appendMessage("agent", job.error || "The agent could not update the project.");
+          finishChatRequest();
+          return;
+        }
+        window.setTimeout(function () {
+          pollChatJob(jobId);
+        }, 2000);
+      }).fail(function (xhr) {
+        appendMessage("agent", errorText(xhr, "The agent job could not be checked."));
+        finishChatRequest();
+      });
     }
 
     function errorText(xhr, fallback) {
@@ -268,16 +314,14 @@
         contentType: "application/json",
         data: JSON.stringify({ project_name: name, message }),
       }).done(function (response) {
-        const changed = response.changed_files && response.changed_files.length
-          ? "\nChanged files: " + response.changed_files.join(", ")
-          : "";
-        setDownloadLink(response.project_name);
-        appendMessage("agent", response.reply + changed);
+        if (response.job_id) {
+          pollChatJob(response.job_id);
+          return;
+        }
+        handleChatResult(response);
       }).fail(function (xhr) {
         appendMessage("agent", errorText(xhr, "The agent could not update the project."));
-      }).always(function () {
-        removeLoadingMessage();
-        setBusy(false);
+        finishChatRequest();
       });
     });
 
