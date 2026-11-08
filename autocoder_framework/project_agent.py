@@ -5,13 +5,15 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from html import escape
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 try:
     from dotenv import load_dotenv
@@ -23,15 +25,30 @@ PROJECTS_DIR = ROOT / "generated_apps"
 PUBLISHED_DIR = ROOT / "published_apps"
 LOG_DIR = ROOT / "logs"
 OPENAI_API_LOG = LOG_DIR / "openai_api.log"
-MAX_CONTEXT_CHARS = 24000
+PROJECT_MEMORY_DIR = LOG_DIR / "project_memory"
+PROJECT_REVISION_DIR = LOG_DIR / "project_revisions"
+
+# The old context builder stopped after the first 24k characters and only kept
+# the beginning of each file. That frequently omitted the implementation being
+# changed (for example, an export handler near the end of backend.py).
+MAX_CONTEXT_CHARS = 72000
+MAX_FILE_CONTEXT_CHARS = 30000
+MAX_MEMORY_CONTEXT_CHARS = 24000
+MAX_RECOVERY_CONTEXT_CHARS = 36000
+MAX_REVIEW_CONTEXT_CHARS = 120000
+MAX_HISTORY_ENTRIES_IN_CONTEXT = 40
+MAX_SOURCE_FILE_BYTES = 1000000
 SAFE_FILE_PATTERN = re.compile(r"^[a-zA-Z0-9._\-/]+$")
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 DEFAULT_MODEL = "gpt-4.1-mini"
 DEFAULT_OPENAI_REQUEST_TIMEOUT_SECONDS = 45
 DEFAULT_OPENAI_POLL_INTERVAL_SECONDS = 2
 DEFAULT_OPENAI_BACKGROUND_TIMEOUT_SECONDS = 600
+DEFAULT_REGRESSION_REPAIR_ATTEMPTS = 1
 _APP_PROCESSES = {}
 _ACTIVE_APP_NAME = None
+_PROJECT_LOCKS = {}
+_PROJECT_LOCKS_GUARD = threading.Lock()
 
 
 class AgentBuildError(Exception):
@@ -66,27 +83,104 @@ def list_projects():
     return sorted(path.name for path in PROJECTS_DIR.iterdir() if path.is_dir())
 
 
+def _project_lock(project_name):
+    name = sanitize_project_name(project_name)
+    with _PROJECT_LOCKS_GUARD:
+        return _PROJECT_LOCKS.setdefault(name, threading.RLock())
+
+
 def apply_agent_message(project_name, message):
     name = sanitize_project_name(project_name)
-    target = project_dir(name)
+    if not name:
+        raise AgentBuildError("Write an app name first.")
 
-    files, source, reply = _generate_files(name, message, target)
+    # Chat jobs run in background threads. Serializing each app keeps a second
+    # request from generating against stale files while the first is still
+    # writing its result.
+    with _project_lock(name):
+        return _apply_agent_message_locked(name, message)
+
+
+def _apply_agent_message_locked(name, message):
+    target = project_dir(name)
+    memory = _load_project_memory(name)
+    generated, files = _generate_files(name, message, target, memory)
+    review = None
+
+    if _should_review_proposal(target):
+        attempts = _env_int(
+            "OPENAI_REGRESSION_REPAIR_ATTEMPTS",
+            DEFAULT_REGRESSION_REPAIR_ATTEMPTS,
+        )
+        attempts = max(0, attempts)
+
+        for attempt in range(attempts + 1):
+            review = _review_proposal(name, message, target, memory, files)
+            if review["approved"]:
+                break
+
+            if attempt == attempts:
+                issues = "; ".join(review["issues"]) or "the reviewer could not prove prior behavior was preserved"
+                raise AgentBuildError(
+                    "The context safeguard stopped this edit before any files were changed. "
+                    f"It found: {issues}"
+                )
+
+            generated, files = _generate_files(
+                name,
+                message,
+                target,
+                memory,
+                review_feedback=review["issues"],
+            )
+
+    if not _files_that_would_change(target, files):
+        raise AgentBuildError("The proposed edit does not change any source files. Nothing was changed.")
+
+    revision = _snapshot_project(name, target) if target.exists() else None
     target.mkdir(parents=True, exist_ok=True)
     changed = _write_files(target, files)
     if not changed:
-        raise AgentBuildError("OpenAI returned no writable files. Nothing was published or changed.")
+        raise AgentBuildError("OpenAI returned no changed files. Nothing was published or changed.")
+
+    _remember_successful_change(
+        name,
+        memory,
+        message,
+        generated,
+        changed,
+        revision,
+        review,
+    )
+
+    reply = str(generated.get("reply") or "").strip()
+    guard_note = _context_guard_note(memory, revision, review)
+    if guard_note:
+        reply = f"{reply}\n\n{guard_note}".strip()
 
     return {
         "project_name": name,
-        "reply": reply or f"Updated {name} with {len(changed)} file(s) using {source}.",
+        "reply": reply or f"Updated {name} with {len(changed)} file(s) using OpenAI API.",
         "changed_files": changed,
         "preview_url": f"/apps/{name}/",
+        "context_guard": {
+            "known_requirements": len(_active_requirements(memory)),
+            "reviewed": bool(review),
+            "revision": revision,
+        },
     }
 
 
 def publish_project(project_name):
-    global _ACTIVE_APP_NAME
     name = sanitize_project_name(project_name)
+    if not name:
+        raise AgentBuildError("Write an app name first.")
+    with _project_lock(name):
+        return _publish_project_locked(name)
+
+
+def _publish_project_locked(name):
+    global _ACTIVE_APP_NAME
     source = project_dir(name)
     destination = PUBLISHED_DIR / name
 
@@ -119,10 +213,15 @@ def publish_project(project_name):
 
 
 def delete_project(project_name):
-    global _ACTIVE_APP_NAME
     name = sanitize_project_name(project_name)
     if not name:
         raise AgentBuildError("Write an app name first.")
+    with _project_lock(name):
+        return _delete_project_locked(name)
+
+
+def _delete_project_locked(name):
+    global _ACTIVE_APP_NAME
 
     _stop_project_process(name)
     if _ACTIVE_APP_NAME == name:
@@ -259,21 +358,37 @@ def _find_free_local_port():
         return probe.getsockname()[1]
 
 
-def _generate_files(project_name, message, target):
-    generated = _generate_with_openai(project_name, message, target)
-    files = generated.get("files", [])
+def _generate_files(project_name, message, target, memory, review_feedback=None):
+    generated = _generate_with_openai(
+        project_name,
+        message,
+        target,
+        memory,
+        review_feedback=review_feedback,
+    )
+    files = _validate_file_proposal(target, generated.get("files", []))
     if not files:
         raise AgentBuildError("OpenAI did not return any files. Try the request again with more detail.")
-    return files, f"OpenAI API ({generated.get('model')})", generated.get("reply", "")
+    return generated, files
 
 
-def _generate_with_openai(project_name, message, target):
+def _generate_with_openai(project_name, message, target, memory, review_feedback=None):
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise AgentBuildError("OPENAI_API_KEY is missing. Add it to .env before building apps.")
 
     model = os.getenv("OPENAI_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
-    context = _project_context(target)
+    focus_text = _memory_focus_text(memory, message)
+    context = _project_context(target, focus_text)
+    memory_context = _memory_context(memory, focus_text=message)
+    recovery_context = _recovery_context(memory, message)
+    repair_context = ""
+    if review_feedback:
+        repair_context = f"""
+The previous proposal was rejected before writing any files. Correct these specific regression findings while still completing the user request:
+{_format_review_feedback(review_feedback)}
+"""
+
     prompt = f"""
 You are editing a complete web app folder named "{project_name}".
 The app will be served by Flask at /apps/{project_name}/.
@@ -281,7 +396,8 @@ Optional app backends are served by Flask at /api/apps/{project_name}/.
 
 Rules:
 - Return JSON only.
-- Create or replace complete files.
+- Return complete contents only for files that actually need to change. Omit untouched files.
+- Make the smallest safe change. Do not rewrite an unrelated file for style, cleanup, or a new architecture.
 - Do not include shell commands.
 - Keep paths relative and inside the project folder.
 - Prefer index.html, styles.css, and app.js.
@@ -303,6 +419,15 @@ Rules:
 - Convert Mongo ObjectId values to strings before returning documents.
 - handle_request may return a dict/list body, (body, status), or (body, status, headers).
 - For unsupported backend routes return {{"ok": False, "error": "Not found"}}, 404.
+- Current source, saved feature requirements, and prior user messages describe commitments already accepted for this app. Preserve every commitment unless the current request explicitly asks to remove or replace it.
+- A request to add or fix one feature never authorizes removing a different feature. In particular, preserve existing data formats, download/export contents, routes, storage, and UI flows unless explicitly changed.
+- Read the relevant source before editing it. If a needed function is outside an excerpt, retain the existing behavior rather than guessing or replacing the file wholesale.
+- Before returning, trace the affected user flow end-to-end and verify that the new feature and every saved commitment still work together.
+
+Saved project memory (authoritative user intent; later messages override earlier ones only when they clearly conflict):
+{memory_context}
+
+{recovery_context}
 
 Current files:
 {context}
@@ -310,34 +435,34 @@ Current files:
 User request:
 {message}
 
+{repair_context}
+
 JSON shape:
 {{
   "files": [
     {{"path": "index.html", "content": "..."}}
   ],
-  "reply": "Short explanation for the chat UI."
+  "reply": "Short explanation for the chat UI.",
+  "memory": {{
+    "app_summary": "A concise description of the app after this edit.",
+    "new_requirements": ["New or clarified user-visible behavior introduced by this request."],
+    "retire_requirement_ids": []
+  }}
 }}
+
+Only list a requirement in retire_requirement_ids when the current user explicitly asked to remove or replace that exact saved requirement. Never retire a requirement merely because it is not involved in this edit.
 """
 
     request_payload = {"model": model, "input": prompt, "background": True}
     max_output_tokens = _env_int("OPENAI_MAX_OUTPUT_TOKENS", None)
     if max_output_tokens:
         request_payload["max_output_tokens"] = max_output_tokens
-    _log_openai_exchange(
+    output_text, response_data = _run_openai_background_prompt(
+        project_name,
+        api_key,
+        request_payload,
         "request",
-        {
-            "project_name": project_name,
-            "url": OPENAI_RESPONSES_URL,
-            "payload": request_payload,
-        },
     )
-
-    response_data = _create_openai_background_response(project_name, api_key, request_payload)
-    response_data = _wait_for_openai_response(project_name, api_key, response_data)
-
-    output_text = _extract_response_text(response_data)
-    if not output_text:
-        raise AgentBuildError(f"OpenAI returned an empty response:\n{json.dumps(response_data, indent=2)}")
 
     try:
         data = _parse_json_response(output_text)
@@ -351,8 +476,27 @@ JSON shape:
     return {
         "files": files,
         "reply": data.get("reply", ""),
+        "memory": data.get("memory", {}),
         "model": response_data.get("model", model),
     }
+
+
+def _run_openai_background_prompt(project_name, api_key, request_payload, request_event):
+    _log_openai_exchange(
+        request_event,
+        {
+            "project_name": project_name,
+            "url": OPENAI_RESPONSES_URL,
+            "payload": request_payload,
+        },
+    )
+
+    response_data = _create_openai_background_response(project_name, api_key, request_payload)
+    response_data = _wait_for_openai_response(project_name, api_key, response_data)
+    output_text = _extract_response_text(response_data)
+    if not output_text:
+        raise AgentBuildError(f"OpenAI returned an empty response:\n{json.dumps(response_data, indent=2)}")
+    return output_text, response_data
 
 
 def _create_openai_background_response(project_name, api_key, request_payload):
@@ -488,6 +632,17 @@ def _env_float(name, default):
         return default
 
 
+def _env_bool(name, default):
+    value = os.getenv(name, "").strip().lower()
+    if not value:
+        return default
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 def _extract_response_text(response_data):
     if response_data.get("output_text"):
         return response_data["output_text"]
@@ -535,46 +690,697 @@ def _parse_json_response(text):
         return json.loads(text[start:end + 1])
 
 
-def _project_context(target):
+def _should_review_proposal(target):
+    if not _env_bool("OPENAI_REGRESSION_REVIEW", True):
+        return False
+    if not target.exists():
+        return False
+    return any(path.is_file() for path in target.rglob("*"))
+
+
+def _review_proposal(project_name, message, target, memory, files):
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise AgentBuildError("OPENAI_API_KEY is missing. Add it to .env before building apps.")
+
+    model = os.getenv("OPENAI_REVIEW_MODEL", "").strip()
+    if not model:
+        model = os.getenv("OPENAI_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
+
+    review_limit = max(
+        16000,
+        _env_int("OPENAI_REVIEW_CONTEXT_MAX_CHARS", MAX_REVIEW_CONTEXT_CHARS),
+    )
+    focus_text = _memory_focus_text(memory, message)
+    current_context = _project_context(
+        target,
+        focus_text,
+        limit=min(MAX_CONTEXT_CHARS, review_limit // 2),
+    )
+    proposal_context = _proposal_context(
+        target,
+        files,
+        focus_text,
+        limit=max(8000, review_limit - len(current_context)),
+    )
+    memory_context = _memory_context(
+        memory,
+        limit=min(MAX_MEMORY_CONTEXT_CHARS, review_limit // 3),
+        focus_text=message,
+    )
+
+    prompt = f"""
+You are a strict regression reviewer for a web app. You do not write code in this step.
+
+The proposal contains complete replacements for only the files that change. Every other current file remains unchanged. Existing source, saved requirements, and prior user messages are commitments. The new user request is also mandatory; it only supersedes an earlier commitment when it explicitly says so.
+
+Approve only when the proposed files implement the user request while preserving all relevant existing behavior. Check user-visible flows end to end, especially data shapes, exports/download contents, file/image handling, storage, routes, and frontend/backend compatibility. Reject when a prior feature is removed, data is silently dropped, or the proposal is too incomplete to establish compatibility. Do not reject merely because an unrelated improvement was not made.
+
+Saved project memory:
+{memory_context}
+
+User request:
+{message}
+
+Current source:
+{current_context}
+
+Proposed replacements:
+{proposal_context}
+
+Return JSON only in this shape:
+{{
+  "approved": true,
+  "summary": "Brief reason for the decision.",
+  "issues": ["Only blocking regressions or missing requested behavior, with a concrete fix."]
+}}
+"""
+
+    request_payload = {"model": model, "input": prompt, "background": True}
+    max_output_tokens = _env_int("OPENAI_REVIEW_MAX_OUTPUT_TOKENS", 2400)
+    if max_output_tokens:
+        request_payload["max_output_tokens"] = max_output_tokens
+
+    output_text, response_data = _run_openai_background_prompt(
+        project_name,
+        api_key,
+        request_payload,
+        "regression_review_request",
+    )
+    try:
+        data = _parse_json_response(output_text)
+    except json.JSONDecodeError as exc:
+        raise AgentBuildError(
+            "The context safeguard could not parse its regression review, so source files were left unchanged."
+        ) from exc
+
+    if not isinstance(data, dict) or not isinstance(data.get("approved"), bool):
+        raise AgentBuildError(
+            "The context safeguard returned an invalid regression review, so source files were left unchanged."
+        )
+
+    raw_issues = data.get("issues", [])
+    if isinstance(raw_issues, str):
+        raw_issues = [raw_issues]
+    if not isinstance(raw_issues, list):
+        raw_issues = []
+    issues = [str(issue).strip()[:1200] for issue in raw_issues if str(issue).strip()]
+    summary = str(data.get("summary") or "").strip()[:1200]
+    if not data["approved"] and not issues:
+        issues = [summary or "The reviewer could not prove that prior behavior was preserved."]
+
+    return {
+        "approved": data["approved"],
+        "summary": summary,
+        "issues": issues,
+        "model": response_data.get("model", model),
+    }
+
+
+def _proposal_context(target, files, focus_text, limit):
+    if not files:
+        return "No proposed files."
+
+    terms = _context_terms(focus_text)
+    remaining = max(1, limit)
     snippets = []
+    for index, item in enumerate(files):
+        relative = item["path"]
+        destination = (target.resolve() / relative).resolve()
+        existing = _read_text_file(destination) if destination.exists() else None
+        before = existing if existing is not None else "(new file)"
+        files_left = len(files) - index
+        per_version_limit = max(1200, remaining // max(1, files_left * 2))
+        before_excerpt = _excerpt_file_content(before, terms, per_version_limit)
+        after_excerpt = _excerpt_file_content(item["content"], terms, per_version_limit)
+        snippet = (
+            f"--- {relative}: current ---\n{before_excerpt}\n\n"
+            f"--- {relative}: proposed ---\n{after_excerpt}"
+        )
+        if len(snippet) > remaining:
+            snippet = _trim_context(snippet, remaining)
+        snippets.append(snippet)
+        remaining -= len(snippet) + 2
+        if remaining <= 0:
+            break
+
+    return "\n\n".join(snippets)
+
+
+def _format_review_feedback(review_feedback):
+    if isinstance(review_feedback, str):
+        review_feedback = [review_feedback]
+    if not isinstance(review_feedback, list):
+        return "- Preserve all existing user-visible behavior."
+    return "\n".join(f"- {str(item).strip()}" for item in review_feedback if str(item).strip())
+
+
+def _new_project_memory(project_name):
+    now = datetime.now(timezone.utc).isoformat()
+    return {
+        "version": 1,
+        "project_name": project_name,
+        "created_at": now,
+        "updated_at": now,
+        "app_summary": "",
+        "requirements": [],
+        "history": [],
+    }
+
+
+def _project_memory_path(project_name):
+    return PROJECT_MEMORY_DIR / f"{sanitize_project_name(project_name)}.json"
+
+
+def _load_project_memory(project_name):
+    path = _project_memory_path(project_name)
+    if not path.exists():
+        return _new_project_memory(project_name)
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AgentBuildError(
+            f"Project memory for {project_name} cannot be read. Source files were left unchanged."
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise AgentBuildError(
+            f"Project memory for {project_name} is invalid. Source files were left unchanged."
+        )
+
+    data.setdefault("version", 1)
+    data["project_name"] = project_name
+    data.setdefault("created_at", datetime.now(timezone.utc).isoformat())
+    data.setdefault("updated_at", data["created_at"])
+    data["app_summary"] = str(data.get("app_summary") or "")
+    data["requirements"] = _normalize_requirements(data.get("requirements"))
+    data["history"] = data.get("history") if isinstance(data.get("history"), list) else []
+    return data
+
+
+def _normalize_requirements(requirements):
+    if not isinstance(requirements, list):
+        return []
+
+    normalized = []
+    next_number = 1
+    for entry in requirements:
+        if isinstance(entry, str):
+            entry = {"text": entry}
+        if not isinstance(entry, dict):
+            continue
+        text = str(entry.get("text") or "").strip()
+        if not text:
+            continue
+        requirement_id = str(entry.get("id") or "").strip()
+        if not requirement_id:
+            requirement_id = f"req-{next_number:03d}"
+        next_number += 1
+        normalized.append(
+            {
+                "id": requirement_id,
+                "text": text[:1600],
+                "status": "retired" if entry.get("status") == "retired" else "active",
+                "created_at": entry.get("created_at"),
+                "retired_at": entry.get("retired_at"),
+            }
+        )
+    return normalized
+
+
+def _active_requirements(memory):
+    return [
+        requirement
+        for requirement in memory.get("requirements", [])
+        if isinstance(requirement, dict)
+        and requirement.get("status", "active") == "active"
+        and str(requirement.get("text") or "").strip()
+    ]
+
+
+def _memory_context(memory, limit=None, focus_text=""):
+    limit = max(2000, limit or _env_int("OPENAI_MEMORY_CONTEXT_MAX_CHARS", MAX_MEMORY_CONTEXT_CHARS))
+    summary_budget = min(1800, max(500, limit // 5))
+    lines = ["Project summary:", _trim_context(str(memory.get("app_summary") or "(not recorded yet)"), summary_budget)]
+
+    requirements = _active_requirements(memory)
+    lines.append("\nActive feature contract:")
+    if requirements:
+        terms = _context_terms(focus_text)
+        indexed_requirements = list(enumerate(requirements))
+        indexed_requirements.sort(
+            key=lambda item: (
+                -sum(term in item[1]["text"].lower() for term in terms),
+                -item[0],
+            )
+        )
+        requirement_budget = max(1000, int(limit * 0.52))
+        requirement_used = len("\n".join(lines))
+        included = 0
+        for _, requirement in indexed_requirements:
+            line = f"- {requirement['id']}: {_trim_context(requirement['text'], 900)}"
+            if requirement_used + len(line) > requirement_budget:
+                continue
+            lines.append(line)
+            requirement_used += len(line) + 1
+            included += 1
+        if included < len(requirements):
+            lines.append(f"- ({len(requirements) - included} additional active requirements remain in durable project memory.)")
+    else:
+        lines.append("- No separate contract has been recorded yet; preserve the current source as the baseline.")
+
+    prefix = "\n".join(lines)
+    history_budget = max(0, limit - len(prefix) - 80)
+    history_lines = []
+    used = 0
+    for entry in reversed(memory.get("history", [])[-MAX_HISTORY_ENTRIES_IN_CONTEXT:]):
+        if not isinstance(entry, dict):
+            continue
+        request = _trim_context(str(entry.get("user_request") or ""), 900)
+        if not request:
+            continue
+        changed_files = ", ".join(entry.get("changed_files") or [])
+        line = f"- {entry.get('timestamp', 'previous request')}: {request}"
+        if changed_files:
+            line += f" (changed: {changed_files})"
+        if used + len(line) > history_budget:
+            break
+        history_lines.insert(0, line)
+        used += len(line) + 1
+
+    if history_lines:
+        return f"{prefix}\n\nPrior user requests (chronological):\n" + "\n".join(history_lines)
+    return prefix
+
+
+def _memory_focus_text(memory, message):
+    fragments = [str(message or "")]
+    fragments.extend(requirement["text"] for requirement in _active_requirements(memory))
+    for entry in memory.get("history", [])[-12:]:
+        if isinstance(entry, dict):
+            fragments.append(str(entry.get("user_request") or ""))
+    return "\n".join(fragments)
+
+
+def _is_regression_request(message):
+    return bool(
+        re.search(
+            r"\b(broken|regress(?:ion)?|missing|gone|lost|disappeared|not working|stopped working|restore|bring back|add .{0,40} back|ruined|no longer|removed)\b",
+            str(message or "").lower(),
+        )
+    )
+
+
+def _recovery_context(memory, message):
+    if not _is_regression_request(message):
+        return ""
+
+    limit = max(
+        4000,
+        _env_int("OPENAI_RECOVERY_CONTEXT_MAX_CHARS", MAX_RECOVERY_CONTEXT_CHARS),
+    )
+    base = PROJECT_REVISION_DIR.resolve()
+    focus_text = _memory_focus_text(memory, message)
+    remaining = limit
+    snapshots = []
+    for entry in reversed(memory.get("history", [])):
+        if len(snapshots) >= 2 or remaining <= 0:
+            break
+        if not isinstance(entry, dict) or not entry.get("revision"):
+            continue
+        snapshot = (ROOT / str(entry["revision"])).resolve()
+        if base not in snapshot.parents or not snapshot.exists():
+            continue
+        source = _project_context(snapshot, focus_text, limit=min(remaining, limit // 2))
+        snapshots.append(
+            f"Snapshot before {entry.get('timestamp', 'a prior change')} "
+            f"({entry.get('user_request', 'prior request')}):\n{source}"
+        )
+        remaining -= len(snapshots[-1]) + 2
+
+    if not snapshots:
+        return ""
+    return (
+        "Relevant earlier source snapshots are included because the user reported a regression. "
+        "Use them only to recover the missing behavior; retain newer unrelated work.\n\n"
+        + "\n\n".join(snapshots)
+    )
+
+
+def _snapshot_project(project_name, target):
+    if not target.exists():
+        return None
+
+    revision_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "-" + uuid.uuid4().hex[:8]
+    destination = PROJECT_REVISION_DIR / sanitize_project_name(project_name) / revision_id
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(
+            target,
+            destination,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".DS_Store"),
+        )
+    except OSError as exc:
+        raise AgentBuildError(
+            "Could not create a recovery snapshot, so source files were left unchanged."
+        ) from exc
+    return destination.relative_to(ROOT).as_posix()
+
+
+def _remember_successful_change(project_name, memory, message, generated, changed, revision, review):
+    now = datetime.now(timezone.utc).isoformat()
+    memory_update = generated.get("memory") if isinstance(generated.get("memory"), dict) else {}
+    summary = str(memory_update.get("app_summary") or "").strip()
+    if summary:
+        memory["app_summary"] = summary[:2400]
+
+    existing_text = {
+        requirement["text"].strip().lower()
+        for requirement in _active_requirements(memory)
+    }
+    next_number = _next_requirement_number(memory)
+    new_requirements = memory_update.get("new_requirements", [])
+    if isinstance(new_requirements, str):
+        new_requirements = [new_requirements]
+    if isinstance(new_requirements, list):
+        for requirement_text in new_requirements:
+            requirement_text = str(requirement_text or "").strip()
+            normalized = requirement_text.lower()
+            if not requirement_text or normalized in existing_text:
+                continue
+            memory["requirements"].append(
+                {
+                    "id": f"req-{next_number:03d}",
+                    "text": requirement_text[:1600],
+                    "status": "active",
+                    "created_at": now,
+                    "retired_at": None,
+                }
+            )
+            existing_text.add(normalized)
+            next_number += 1
+
+    if _explicitly_retires_requirement(message):
+        retired_ids = memory_update.get("retire_requirement_ids", [])
+        if isinstance(retired_ids, str):
+            retired_ids = [retired_ids]
+        if isinstance(retired_ids, list):
+            retired_ids = {str(requirement_id).strip() for requirement_id in retired_ids}
+            for requirement in memory["requirements"]:
+                if requirement["id"] in retired_ids and requirement["status"] == "active":
+                    requirement["status"] = "retired"
+                    requirement["retired_at"] = now
+
+    memory["history"].append(
+        {
+            "id": uuid.uuid4().hex,
+            "timestamp": now,
+            "user_request": str(message),
+            "agent_reply": str(generated.get("reply") or "")[:2400],
+            "changed_files": list(changed),
+            "revision": revision,
+            "reviewed": bool(review),
+            "review_summary": str(review.get("summary") or "")[:1200] if review else "",
+        }
+    )
+    memory["updated_at"] = now
+    _write_project_memory(project_name, memory)
+
+
+def _next_requirement_number(memory):
+    numbers = []
+    for requirement in memory.get("requirements", []):
+        match = re.fullmatch(r"req-(\d+)", str(requirement.get("id") or ""))
+        if match:
+            numbers.append(int(match.group(1)))
+    return max(numbers, default=0) + 1
+
+
+def _explicitly_retires_requirement(message):
+    return bool(
+        re.search(
+            r"\b(remove|delete|drop|replace|instead of|no longer|stop using|retire)\b",
+            str(message or "").lower(),
+        )
+    )
+
+
+def _write_project_memory(project_name, memory):
+    path = _project_memory_path(project_name)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _write_text_atomically(path, json.dumps(memory, ensure_ascii=False, indent=2) + "\n")
+    except OSError as exc:
+        raise AgentBuildError(
+            "Source files were updated, but their durable project memory could not be saved. "
+            "Do not make another edit until the logs directory is writable."
+        ) from exc
+
+
+def _context_guard_note(memory, revision, review):
+    requirements = len(_active_requirements(memory))
+    parts = [f"Context guard: recorded {requirements} active requirement(s)."]
+    if review:
+        parts.append("The proposed change passed a regression review before source files were written.")
+    if revision:
+        parts.append("A pre-change recovery snapshot was saved.")
+    return " ".join(parts)
+
+
+def _project_context(target, focus_text="", limit=None):
     if not target.exists():
         return "No files yet."
 
-    for path in sorted(target.rglob("*")):
-        if not path.is_file():
-            continue
-        relative = path.relative_to(target).as_posix()
-        if path.stat().st_size > 250000:
+    limit = max(2000, limit or _env_int("OPENAI_CONTEXT_MAX_CHARS", MAX_CONTEXT_CHARS))
+    terms = _context_terms(focus_text)
+    candidates = []
+    for path in target.rglob("*"):
+        if not path.is_file() or "__pycache__" in path.parts:
             continue
         try:
-            content = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
+            if path.stat().st_size > MAX_SOURCE_FILE_BYTES:
+                continue
+        except OSError:
             continue
-        snippets.append(f"--- {relative} ---\n{content[:4000]}")
-        if sum(len(item) for item in snippets) > MAX_CONTEXT_CHARS:
+        content = _read_text_file(path)
+        if content is None:
+            continue
+        relative = path.relative_to(target).as_posix()
+        candidates.append((_context_score(relative, content, terms), relative, content))
+
+    remaining = limit
+    snippets = []
+    for _, relative, content in sorted(candidates, key=lambda item: (-item[0], item[1])):
+        if remaining <= 0:
             break
+        content_limit = min(MAX_FILE_CONTEXT_CHARS, max(600, remaining - len(relative) - 12))
+        excerpt = _excerpt_file_content(content, terms, content_limit)
+        snippet = f"--- {relative} ---\n{excerpt}"
+        if len(snippet) > remaining:
+            snippet = _trim_context(snippet, remaining)
+        snippets.append(snippet)
+        remaining -= len(snippet) + 2
 
     return "\n\n".join(snippets) or "No readable files yet."
 
 
-def _write_files(target, files):
-    changed = []
+def _context_terms(text):
+    stop_words = {
+        "about", "after", "again", "allow", "also", "and", "app", "back", "before", "but",
+        "can", "change", "content", "does", "each", "feature", "file", "for", "from", "have",
+        "here", "into", "just", "make", "more", "need", "new", "not", "now", "only", "post",
+        "previous", "please", "should", "that", "the", "then", "this", "use", "with", "would",
+    }
+    terms = []
+    for term in re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{2,}", str(text or "").lower()):
+        if term in stop_words or term in terms:
+            continue
+        terms.append(term)
+        if len(terms) == 40:
+            break
+    return terms
+
+
+def _context_score(relative, content, terms):
+    relative_lower = relative.lower()
+    score = 0
+    priority = {
+        "backend.py": 60,
+        "app.py": 58,
+        "app.js": 56,
+        "index.html": 54,
+        "styles.css": 30,
+        "readme.md": 20,
+    }
+    score += priority.get(relative_lower.rsplit("/", 1)[-1], 10)
+    content_lower = content.lower()
+    for term in terms:
+        if term in relative_lower:
+            score += 45
+        occurrences = content_lower.count(term)
+        score += min(occurrences, 8) * 4
+    return score
+
+
+def _read_text_file(path):
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _excerpt_file_content(content, terms, max_chars):
+    content = str(content)
+    if len(content) <= max_chars:
+        return content
+    if max_chars <= 0:
+        return ""
+
+    lines = content.splitlines(keepends=True)
+    if not lines:
+        return content[:max_chars]
+    lower_lines = [line.lower() for line in lines]
+    intervals = [(0, min(len(lines), 30)), (max(0, len(lines) - 30), len(lines))]
+    for term in terms:
+        matches = [index for index, line in enumerate(lower_lines) if term in line]
+        for index in matches[:3]:
+            intervals.append((max(0, index - 12), min(len(lines), index + 34)))
+
+    merged = []
+    for start, end in sorted(intervals):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+
+    parts = []
+    previous_end = 0
+    for start, end in merged:
+        if start > previous_end:
+            parts.append("\n... [omitted unchanged source] ...\n")
+        parts.extend(lines[start:end])
+        previous_end = end
+    return _trim_context("".join(parts), max_chars)
+
+
+def _trim_context(text, limit):
+    text = str(text)
+    if len(text) <= limit:
+        return text
+    if limit <= 80:
+        return text[:limit]
+    head = max(40, int(limit * 0.7))
+    tail = max(20, limit - head - 40)
+    return text[:head] + "\n... [truncated] ...\n" + text[-tail:]
+
+
+def _validate_file_proposal(target, files):
+    if not isinstance(files, list):
+        raise AgentBuildError("OpenAI returned JSON without a valid files array.")
+
+    target_root = target.resolve()
+    normalized = []
+    seen = set()
     for item in files:
-        relative = (item.get("path") or "").strip().replace("\\", "/")
-        content = item.get("content", "")
+        if not isinstance(item, dict):
+            raise AgentBuildError("OpenAI returned an invalid file entry. Source files were left unchanged.")
+        raw_path = item.get("path")
+        content = item.get("content")
+        if not isinstance(raw_path, str) or not isinstance(content, str):
+            raise AgentBuildError("Each generated file needs a text path and text content. Source files were left unchanged.")
+        relative = raw_path.strip().replace("\\", "/")
+        path_parts = PurePosixPath(relative).parts
+        if (
+            not relative
+            or not SAFE_FILE_PATTERN.fullmatch(relative)
+            or PurePosixPath(relative).is_absolute()
+            or any(part in {"", ".", ".."} for part in path_parts)
+        ):
+            raise AgentBuildError(f"OpenAI returned an unsafe file path ({raw_path!r}). Source files were left unchanged.")
+        if relative in seen:
+            raise AgentBuildError(f"OpenAI returned {relative} more than once. Source files were left unchanged.")
+        destination = (target_root / relative).resolve()
+        if target_root not in destination.parents:
+            raise AgentBuildError(f"OpenAI returned a file outside the project ({raw_path!r}). Source files were left unchanged.")
+        seen.add(relative)
+        normalized.append({"path": relative, "content": content})
+    return normalized
 
-        if not relative or not SAFE_FILE_PATTERN.match(relative):
+
+def _files_that_would_change(target, files):
+    changed = []
+    target_root = target.resolve()
+    for item in files:
+        destination = (target_root / item["path"]).resolve()
+        if not destination.exists():
+            changed.append(item)
             continue
-
-        destination = (target / relative).resolve()
-        if target.resolve() not in destination.parents and destination != target.resolve():
-            continue
-
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(content, encoding="utf-8")
-        changed.append(relative)
-
+        existing = _read_text_file(destination)
+        if existing is None:
+            raise AgentBuildError(
+                f"Refusing to overwrite non-text file {item['path']}. Source files were left unchanged."
+            )
+        if existing != item["content"]:
+            changed.append(item)
     return changed
+
+
+def _write_files(target, files):
+    changed_files = _files_that_would_change(target, files)
+    staged = []
+    committed = []
+    try:
+        for item in changed_files:
+            destination = (target.resolve() / item["path"]).resolve()
+            existed = destination.exists()
+            original = _read_text_file(destination) if existed else None
+            if existed and original is None:
+                raise AgentBuildError(
+                    f"Refusing to overwrite non-text file {item['path']}. Source files were left unchanged."
+                )
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+            temporary.write_text(item["content"], encoding="utf-8")
+            staged.append(
+                {
+                    "path": item["path"],
+                    "destination": destination,
+                    "temporary": temporary,
+                    "existed": existed,
+                    "original": original,
+                }
+            )
+
+        for plan in staged:
+            os.replace(plan["temporary"], plan["destination"])
+            committed.append(plan)
+    except Exception as exc:
+        for plan in staged:
+            temporary = plan["temporary"]
+            if temporary.exists():
+                temporary.unlink()
+        for plan in reversed(committed):
+            if plan["existed"]:
+                _write_text_atomically(plan["destination"], plan["original"])
+            elif plan["destination"].exists():
+                plan["destination"].unlink()
+        if isinstance(exc, AgentBuildError):
+            raise
+        raise AgentBuildError("Could not write the proposed files. Previous source was restored.") from exc
+
+    return [plan["path"] for plan in staged]
+
+
+def _write_text_atomically(path, content):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def _local_app_files(project_name, message):
