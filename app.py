@@ -44,6 +44,8 @@ from autocoder_framework.project_agent import (
     sanitize_project_name,
 )
 
+import shared_access
+
 try:
     from bson import ObjectId
     from pymongo import MongoClient
@@ -75,12 +77,47 @@ def require_authentication():
     if _is_authenticated() or _has_valid_basic_auth():
         return None
 
+    allowed_apps = _current_guest_apps()
+    if allowed_apps is not None:
+        return _guard_guest_request(allowed_apps)
+
     return _auth_required_response()
+
+
+GUEST_APP_ENDPOINTS = {"serve_published_app", "serve_published_asset", "serve_app_backend"}
+
+
+def _current_guest_apps():
+    """Apps the signed-in guest may access, or None when the session is not a valid guest."""
+    if session.get("role") != "guest":
+        return None
+    apps = shared_access.guest_apps(session.get("auth_user", ""))
+    if apps is None:
+        session.clear()
+    return apps
+
+
+def _guard_guest_request(allowed_apps):
+    if request.endpoint == "index":
+        return render_template("guest.html", apps=sorted(allowed_apps), auth_user=session.get("auth_user"))
+
+    if request.endpoint in GUEST_APP_ENDPOINTS:
+        project_name = sanitize_project_name((request.view_args or {}).get("project_name", ""))
+        if project_name in allowed_apps:
+            return None
+    elif request.endpoint == "proxy_active_published_app_api":
+        backend = _published_app_backend_for_request(allow_active_fallback=False)
+        if backend and backend["project_name"] in allowed_apps:
+            return None
+
+    if request.path.startswith("/api/"):
+        return jsonify({"ok": False, "error": "You do not have access to this resource."}), 403
+    return redirect(url_for("index"))
 
 
 @app.get("/login")
 def login():
-    if _auth_configured() and _is_authenticated():
+    if _auth_configured() and (_is_authenticated() or _current_guest_apps() is not None):
         return redirect(_safe_next_url(request.args.get("next")))
 
     return render_template("login.html", auth_configured=_auth_configured())
@@ -97,21 +134,30 @@ def login_submit():
 
     valid_user = compare_digest(username, expected_user)
     valid_password = compare_digest(password, expected_password)
-    if not (valid_user and valid_password):
-        return (
-            render_template(
-                "login.html",
-                auth_configured=True,
-                error="Invalid user or password.",
-                username=username,
-            ),
-            401,
-        )
+    next_url = _safe_next_url(request.form.get("next") or request.args.get("next"))
 
-    session.clear()
-    session["authenticated"] = True
-    session["auth_user"] = expected_user
-    return redirect(_safe_next_url(request.form.get("next") or request.args.get("next")))
+    if valid_user and valid_password:
+        session.clear()
+        session["authenticated"] = True
+        session["role"] = "owner"
+        session["auth_user"] = expected_user
+        return redirect(next_url)
+
+    if username != expected_user and shared_access.verify_guest(username, password):
+        session.clear()
+        session["role"] = "guest"
+        session["auth_user"] = username
+        return redirect(next_url)
+
+    return (
+        render_template(
+            "login.html",
+            auth_configured=True,
+            error="Invalid user or password.",
+            username=username,
+        ),
+        401,
+    )
 
 
 @app.post("/logout")
@@ -147,8 +193,13 @@ def _auth_configured():
 
 
 def _is_authenticated():
+    """True only for the owner session; guests are handled by _current_guest_apps()."""
     expected_user, _ = _auth_credentials()
-    return bool(session.get("authenticated") and session.get("auth_user") == expected_user)
+    return bool(
+        session.get("authenticated")
+        and session.get("role", "owner") == "owner"
+        and session.get("auth_user") == expected_user
+    )
 
 
 def _has_valid_basic_auth():
@@ -269,7 +320,79 @@ def delete():
     except Exception as exc:
         return jsonify({"ok": False, "error": f"Unexpected delete error: {exc}"}), 500
 
+    shared_access.remove_app_everywhere(project_name)
     return jsonify({"ok": True, **result})
+
+
+def _share_payload():
+    payload = request.get_json(silent=True) or {}
+    project_name = sanitize_project_name(payload.get("project_name", ""))
+    username = (payload.get("username") or "").strip()
+    return payload, project_name, username
+
+
+def _share_state(project_name):
+    guests = shared_access.list_guests()
+    return {
+        "project_name": project_name,
+        "shared_with": [guest["username"] for guest in guests if project_name in guest["apps"]],
+        "guests": guests,
+    }
+
+
+@app.get("/api/share/<project_name>")
+def share_status(project_name):
+    project_name = sanitize_project_name(project_name)
+    if not project_name:
+        return jsonify({"ok": False, "error": "Invalid project name."}), 400
+    return jsonify({"ok": True, **_share_state(project_name)})
+
+
+@app.post("/api/share")
+def share():
+    """Create a new guest for the app, or grant the app to an existing guest."""
+    _, project_name, username = _share_payload()
+    if not project_name:
+        return jsonify({"ok": False, "error": "Write an app name first."}), 400
+    if not (PUBLISHED_DIR / project_name / "index.html").exists():
+        return jsonify({"ok": False, "error": "Publish this app before sharing it."}), 400
+
+    password = None
+    if username:
+        if not shared_access.grant_app(username, project_name):
+            return jsonify({"ok": False, "error": "That user no longer exists."}), 404
+    else:
+        owner_user, _ = _auth_credentials()
+        username, password = shared_access.create_guest(project_name, reserved_usernames={owner_user})
+
+    return jsonify(
+        {
+            "ok": True,
+            "username": username,
+            "password": password,
+            "login_url": url_for("login", _external=True),
+            "app_url": url_for("serve_published_app", project_name=project_name, _external=True) + "/",
+            **_share_state(project_name),
+        }
+    )
+
+
+@app.post("/api/share/reset-password")
+def share_reset_password():
+    _, project_name, username = _share_payload()
+    password = shared_access.reset_password(username)
+    if password is None:
+        return jsonify({"ok": False, "error": "That user no longer exists."}), 404
+    return jsonify({"ok": True, "username": username, "password": password, **_share_state(project_name)})
+
+
+@app.post("/api/share/revoke")
+def share_revoke():
+    _, project_name, username = _share_payload()
+    if not project_name or not username:
+        return jsonify({"ok": False, "error": "Missing app or user."}), 400
+    shared_access.revoke_app(username, project_name)
+    return jsonify({"ok": True, **_share_state(project_name)})
 
 
 @app.get("/api/download/<project_name>")
@@ -374,7 +497,7 @@ def proxy_active_published_app_api(api_path):
         ), 502
 
 
-def _published_app_backend_for_request():
+def _published_app_backend_for_request(allow_active_fallback=True):
     referrer = request.referrer or ""
     path = urllib.parse.urlparse(referrer).path
     prefix = "/apps/"
@@ -385,6 +508,8 @@ def _published_app_backend_for_request():
             if backend:
                 return backend
 
+    if not allow_active_fallback:
+        return None
     return active_project_app_backend()
 
 
